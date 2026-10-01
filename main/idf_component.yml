@@ -1,0 +1,10 @@
+dependencies:
+  idf:
+    version: '>=5.0'
+  # AAC-LC 解码。miplay_remote 的 CMakeLists 已 PRIV_REQUIRES esp_audio_codec，
+  # 此处重复声明只为把版本锁在这一处，便于统一升级。
+  espressif/esp_audio_codec: '^2.4.1'
+  # 板载 WS2812 状态灯（RMT 后端，ESP32-S3 支持）。
+  espressif/led_strip: '^3.0.0'
+  # ESP-IDF v5.5 起 mdns 已迁出内置组件，必须显式声明。
+  espressif/mdns: '>=1.0.0'

@@ -1,0 +1,84 @@
+menu "MiPlay Mini Amp"
+
+    menu "Wi-Fi"
+        # 凭据不在编译期固化：设备首次上电没有凭据时会开一个开放热点，
+        # 手机连上去在 192.168.4.1 填 SSID/密码，验证通过才写进 NVS。
+        # 这样同一份固件可以刷到任意一台设备，也不用把家庭 Wi-Fi 密码
+        # 留在源码或 sdkconfig 里。
+
+        config MIPLAY_WIFI_MAX_RETRY
+            int "STA retries before falling back to AP"
+            range 1 20
+            default 3
+            help
+                用已存凭据连接失败几次后，放弃并改开配网热点。
+
+                不设 0（无限重连）：那样设备在换了路由器或改了密码之后会
+                永远沉默——没有屏幕，用户只能看到灯一直闪橙色，却没有任何
+                途径去改配置。留几次重试是为了容忍路由器重启这类瞬时故障，
+                重试完仍失败就必须把配置入口还给用户。
+    endmenu
+
+    menu "I2S / PCM5102A"
+        config MIPLAY_I2S_BCLK_GPIO
+            int "BCLK GPIO"
+            range 0 48
+            default 8
+        config MIPLAY_I2S_LRCK_GPIO
+            int "LRCK (WS) GPIO"
+            range 0 48
+            default 7
+        config MIPLAY_I2S_DIN_GPIO
+            int "DIN (SDATA) GPIO"
+            range 0 48
+            default 6
+
+        config MIPLAY_I2S_ENABLE_MCLK
+            bool "Output MCLK to PCM5102A"
+            default y
+            help
+                打开后主控向模块的 SCK 焊盘输出系统时钟（MCLK GPIO，默认 9）。
+
+                ⚠ 前提：模块的 SCK 焊盘必须处于悬空状态（未接 GND）。
+                GY-PCM5102 有两种流通版本，外观无法区分：
+                  - SCK 悬空：需要外部 MCLK。打开此项（默认）。
+                  - SCK 已接地：用内部 PLL 从 BCK 锁相。此时若把主控引脚
+                    接上去，等于输出脚对地短路，务必关闭此项并断开该连线。
+
+                用万用表量 SCK 对 GND：开路 = 悬空版（选本项），
+                接近 0Ω = 接地版（关本项，且不要接 MCLK 线）。
+                本工程按悬空版接线，故默认打开。
+
+        config MIPLAY_I2S_MCLK_GPIO
+            int "MCLK GPIO"
+            depends on MIPLAY_I2S_ENABLE_MCLK
+            range 0 48
+            default 9
+    endmenu
+
+    menu "Audio"
+        config MIPLAY_DEFAULT_VOLUME
+            int "Default volume (0-100)"
+            range 0 100
+            default 70
+            help
+                开机默认音量。PCM5102A 没有 I2C 控制口，音量完全由
+                软件在 int16 PCM 上缩放实现。
+    endmenu
+
+    menu "Status LED"
+        config MIPLAY_LED_ENABLE
+            bool "Enable status LED"
+            default y
+        config MIPLAY_LED_GPIO
+            int "LED GPIO (48 = onboard WS2812 on SuperMini)"
+            depends on MIPLAY_LED_ENABLE
+            range 0 48
+            default 48
+            help
+                ESP32-S3 SuperMini 板载 WS2812 在 GPIO48。
+                若你的板子没有灯，关闭 MIPLAY_LED_ENABLE 即可，
+                不影响音频功能。
+    endmenu
+
+endmenu

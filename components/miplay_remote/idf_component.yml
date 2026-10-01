@@ -1,0 +1,7 @@
+## MiPlay 遥控接收端的托管组件依赖。
+##
+## ESP-IDF v5.5 起 mdns 已从内置组件迁出，必须通过组件管理器获取。
+## 版本下限与参考实现保持一致（其锁定的是 1.12.0）。
+dependencies:
+  espressif/mdns:
+    version: ">=1.0.0"

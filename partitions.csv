@@ -1,0 +1,10 @@
+# MiPlay Mini Amp 分区表 — 4MB 片内 Flash，无 OTA
+#
+# 单 factory 分区。app 给到 2.94MB：esp_aac_dec + mbedtls + Wi-Fi/lwIP
+# 的静态占用不小，留足余量比事后改分区表省事（改分区表要擦全片）。
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x6000,
+phy_init,   data, phy,      0xF000,   0x1000,
+factory,    app,  factory,  0x10000,  0x2F0000,
+coredump,   data, coredump, 0x300000, 0x10000,
