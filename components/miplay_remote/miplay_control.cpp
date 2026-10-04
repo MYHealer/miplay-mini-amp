@@ -833,104 +833,10 @@ void client_loop(miplay_session_t *session)
                     break;
                 }
                 case CMD_SET_MEDIA_INFO: {
-                    // 手机推送歌曲元数据（title/artist/album/duration）。
-                    // payload 可能是 OPack 二进制 TLV 或 JSON。
-                    // JSON 可能有多层壳：{"metadata":"..."} 或 {"mediaInfoEx":{...}}
-                    ESP_LOGI(kTag, "SET_MEDIA_INFO seq=%u len=%u",
+                    // 只做 ACK，不解析元数据。本设备无屏幕，title/artist/album
+                    // 纯浪费 CPU。音频流不依赖此消息。
+                    ESP_LOGI(kTag, "SET_MEDIA_INFO seq=%u len=%u (ignored)",
                              seq, static_cast<unsigned>(plen));
-                    if (plen > 0) {
-                        char hex[193];
-                        size_t dump = plen < 64 ? plen : 64;
-                        for (size_t i = 0; i < dump; i++)
-                            snprintf(hex + i * 3, 4, "%02X ", payload[i]);
-                        ESP_LOGI(kTag, "SET_MEDIA_INFO payload: %s", hex);
-                    }
-                    char title[128] = {};
-                    char artist[64] = {};
-                    char album[64] = {};
-                    int64_t duration_ms = 0;
-                    int64_t position_ms = 0;
-
-                    // 辅助 lambda：从 JSON 字符串中提取字段值
-                    const char *pj = reinterpret_cast<const char *>(payload);
-                    auto json_get = [&](const char *key, char *out, size_t out_sz) -> bool {
-                        char needle[64];
-                        snprintf(needle, sizeof(needle), "\"%s\":", key);
-                        const char *f = strstr(pj, needle);
-                        if (!f) return false;
-                        f += strlen(needle);
-                        // 跳过空格和引号
-                        while (*f == ' ' || *f == '\t') f++;
-                        if (*f == '"') {
-                            f++; // 跳过开引号
-                            const char *e = strchr(f, '"');
-                            if (!e || (size_t)(e - f) >= out_sz) return false;
-                            memcpy(out, f, e - f);
-                            out[e - f] = '\0';
-                            return true;
-                        }
-                        // 数值
-                        char *endp;
-                        long long val = strtoll(f, &endp, 10);
-                        if (endp > f) {
-                            snprintf(out, out_sz, "%lld", val);
-                            return true;
-                        }
-                        return false;
-                    };
-                    auto json_get_num = [&](const char *key) -> int64_t {
-                        char buf[32];
-                        return json_get(key, buf, sizeof(buf)) ? strtoll(buf, nullptr, 10) : 0;
-                    };
-
-                    if (plen > 0 && payload[0] == '{') {
-                        // JSON 路径：先剥壳 {"metadata":"..."} / {"mediaInfoEx":{...}}
-                        // 然后直接查找字段
-                        json_get("mTitle", title, sizeof(title));
-                        if (!title[0]) json_get("title", title, sizeof(title));
-                        if (!title[0]) json_get("songName", title, sizeof(title));
-                        json_get("mArtist", artist, sizeof(artist));
-                        if (!artist[0]) json_get("artist", artist, sizeof(artist));
-                        if (!artist[0]) json_get("singer", artist, sizeof(artist));
-                        json_get("mAlbum", album, sizeof(album));
-                        if (!album[0]) json_get("album", album, sizeof(album));
-                        duration_ms = json_get_num("mDuration");
-                        if (!duration_ms) duration_ms = json_get_num("duration");
-                        if (!duration_ms) duration_ms = json_get_num("durationMs");
-                        position_ms = json_get_num("mPosition");
-                        if (!position_ms) position_ms = json_get_num("position");
-                        if (!position_ms) position_ms = json_get_num("positionMs");
-                    } else if (plen > 4) {
-                        // OPack 二进制路径
-                        OPackField f;
-                        if (opack_find_field(payload, plen, "mTitle", &f) ||
-                            opack_find_field(payload, plen, "title", &f))
-                            opack_field_to_str(f, title, sizeof(title));
-                        if (opack_find_field(payload, plen, "mArtist", &f) ||
-                            opack_find_field(payload, plen, "artist", &f))
-                            opack_field_to_str(f, artist, sizeof(artist));
-                        if (opack_find_field(payload, plen, "mAlbum", &f) ||
-                            opack_find_field(payload, plen, "album", &f))
-                            opack_field_to_str(f, album, sizeof(album));
-                        if (opack_find_field(payload, plen, "mDuration", &f) ||
-                            opack_find_field(payload, plen, "duration", &f)) {
-                            char dur_buf[32];
-                            opack_field_to_str(f, dur_buf, sizeof(dur_buf));
-                            duration_ms = strtoll(dur_buf, nullptr, 10);
-                        }
-                        if (opack_find_field(payload, plen, "mPosition", &f) ||
-                            opack_find_field(payload, plen, "position", &f)) {
-                            char pos_buf[32];
-                            opack_field_to_str(f, pos_buf, sizeof(pos_buf));
-                            position_ms = strtoll(pos_buf, nullptr, 10);
-                        }
-                    }
-                    if (title[0]) {
-                        ESP_LOGI(kTag, "Media info: title='%s' artist='%s' album='%s' dur=%lld pos=%lld",
-                                 title, artist, album, (long long)duration_ms, (long long)position_ms);
-                        miplay_media_dispatch_meta(title, artist, album, duration_ms, position_ms);
-                    }
-                    // ACK
                     send_maybe_encrypted(session, CMD_SET_MEDIA_INFO_ACK, seq,
                                          nullptr, 0);
                     break;

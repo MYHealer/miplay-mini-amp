@@ -108,16 +108,8 @@ void on_pause_changed(bool paused)
     status_led_set(paused ? STATUS_CONNECTED : STATUS_PLAYING);
 }
 
-// 无屏幕，元数据只记日志。保留回调是为了让协议层拿到 title/artist
-// 时不至于走空指针分支，也方便调试时确认手机确实推了信息。
-void on_media_meta(const char *title, const char *artist, const char *album,
-                   int64_t duration_ms, int64_t position_ms)
-{
-    ESP_LOGI(kTag, "meta: title=\"%s\" artist=\"%s\" album=\"%s\" "
-                   "%lld/%lld ms",
-             title ? title : "", artist ? artist : "", album ? album : "",
-             (long long)position_ms, (long long)duration_ms);
-}
+// 无屏幕，元数据不做任何处理。
+void on_media_meta(const char *, const char *, const char *, int64_t, int64_t) {}
 
 // ── Wi-Fi 状态机 ──
 

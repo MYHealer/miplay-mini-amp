@@ -36,9 +36,9 @@ extern "C" {
 //     表现就是"设备明明应答了 5355，手机列表里却没有它"。
 //   - 显示名 + "(" + 10 字符后缀 + ")" 必须 < 40 字节，否则 snprintf 截断。
 //     后缀固定 12 字节（含括号），故**显示名最多 27 字节**。
-//     "小米妙播耳放" UTF-8 为 18 字节 → 实例名 30 字节，安全。
-//     同时 30 < 63（单 label 上限），dns_push_label 不会截断。
-#define MIPLAY_DEVICE_DISPLAY_NAME "小米妙播耳放"
+//     "MiPlay Mini Amp" ASCII 为 15 字节 → 实例名 27 字节，安全。
+//     同时 27 < 63（单 label 上限），dns_push_label 不会截断。
+#define MIPLAY_DEVICE_DISPLAY_NAME "MiPlay Mini Amp"
 
 // ── mDNS 服务名（ESP-IDF 不自动加下划线，必须手动包含）──
 #define MIPLAY_LYRA_SERVICE  "_lyra-mdns"

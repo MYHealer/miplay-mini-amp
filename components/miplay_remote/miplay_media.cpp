@@ -94,6 +94,19 @@ volatile uint32_t s_media_generation = 0;
 uint8_t s_stream_key[16];
 uint8_t s_stream_iv[16];
 volatile bool s_has_stream_key = false;
+
+// PES 解密游标。必须跨 decrypt_ts_media() 调用存活——一个 ADTS 帧
+// （~690 字节）跨 2 个 188 字节 TS 包，而一次 RTP 只带 1 个 TS 包：
+// 调用 1 见到 PUSI，在 PES 头里解析出 IV 并算出"还要解 256 字节"；
+// 调用 2 只带载荷（pusi=0），要靠这里记着的 remaining/IV 才知道怎么解。
+// 若按调用局部变量处理，调用 2 会从零开始、把整段密文当明文吞下去
+// ——表现就是 TS 层 PID 全对、ADTS 层永远搜不到同步字。
+struct PesDecryptState {
+    uint8_t iv[16];
+    int remaining;      // 还需解密的明文字节数
+    int pes_pay_off;    // PUSI 包内 PES 荷载起始偏移
+};
+PesDecryptState s_pes_dec = {};
 char s_mirror_auth_key[33];
 volatile bool s_has_mirror_auth_key = false;
 
@@ -311,18 +324,8 @@ int rtsp_read_msg(int sock, char *headers, size_t hdr_max,
 }
 
 // ── RTSP 发送工具 ──
-
-int rtsp_send_all(int sock, const void *data, size_t len)
-{
-    const uint8_t *buf = static_cast<const uint8_t *>(data);
-    size_t sent = 0;
-    while (sent < len) {
-        int n = send(sock, buf + sent, len - sent, 0);
-        if (n <= 0) return -1;
-        sent += n;
-    }
-    return static_cast<int>(sent);
-}
+// rtsp_send_all 已删除：未被调用（编译器 defined but not used）。
+// 需要可靠发送时，rtsp_send_req / rtsp_send_resp 内部已自行循环。
 
 void rtsp_send_req(int sock, const char *method, const char *url,
                    const char *extra, int cseq)
@@ -403,14 +406,10 @@ bool pes_extract_iv(const uint8_t *pes, size_t pes_len, uint8_t iv[16])
 }
 
 // 就地解密 TS 流中 PID=0x1100 的 PES 音频前 256 字节。
+// 解密游标 s_pes_dec 是模块级状态：见其声明处的说明。
 void decrypt_ts_media(uint8_t *ts_buf, size_t ts_len)
 {
-    struct PesDecState {
-        uint8_t iv[16];
-        int remaining;
-        int pes_pay_off;
-    };
-    PesDecState st = {};
+    PesDecryptState &st = s_pes_dec;
     for (size_t off = 0; off + kTsPktSize <= ts_len; off += kTsPktSize) {
         uint8_t *pkt = ts_buf + off;
         if (pkt[0] != kTsSyncByte) continue;
@@ -449,7 +448,10 @@ void decrypt_ts_media(uint8_t *ts_buf, size_t ts_len)
         if (st.remaining > 0) {
             int start = pusi ? st.pes_pay_off : 0;
             int avail = pay_len - start;
-            if (avail <= 0) {
+            if (avail < kAesBlockLen) {
+                // 不足一个 AES 块，本包贡献不了任何明文。
+                // 清零 remaining：CBC 链的连续性已经被这个残缺包破坏，
+                // 继续记着它只会让下一个 PES 的第一块解错位。
                 st.remaining = 0;
                 continue;
             }
@@ -464,8 +466,12 @@ void decrypt_ts_media(uint8_t *ts_buf, size_t ts_len)
                                       pkt + pay_off + start);
                 mbedtls_aes_free(&actx);
                 st.remaining -= n;
+            } else {
+                // n 被 16 字节块对齐归零：remaining 非 0 却没有整块可解。
+                // 保留 remaining 无意义（CBC 链已在此断掉），清零以免
+                // 下一次调用误以为还在同一个加密段里，去解不相关的字节。
+                st.remaining = 0;
             }
-            if (st.remaining <= 0) st.remaining = 0;
         }
     }
 }
@@ -535,16 +541,6 @@ struct AacDecoderCtx {
         esp_audio_err_t err =
             esp_aac_dec_decode(handle, &raw, &frame, &info);
 
-        // 一次性诊断：首次解码时打印结果。
-        static bool s_diag_logged = false;
-        if (!s_diag_logged) {
-            s_diag_logged = true;
-            ESP_LOGW(kTag, "[DIAG] decode_and_play: err=%d decoded=%u "
-                           "info_rate=%d info_ch=%d",
-                     (int)err, (unsigned)frame.decoded_size,
-                     (int)info.sample_rate, (int)info.channel);
-        }
-
         if (err == ESP_AUDIO_ERR_OK && frame.decoded_size > 0) {
             // 更新采样率（首帧可能改变）。
             if (info.sample_rate > 0 && info.sample_rate != sample_rate) {
@@ -578,284 +574,9 @@ struct AacDecoderCtx {
     }
 };
 
-// ── 媒体接收任务参数 ──
-struct MediaTaskArg {
-    int media_sock;
-    int rtsp_sock;
-    uint32_t generation;
-};
-
-// ── 媒体接收任务 ──
-// 读 interleaved RTP → 剥 RTP 头 → TS 解密 → AAC 解码 → audio_services。
-void media_receive_task(void *arg)
-{
-    MediaTaskArg *marg = static_cast<MediaTaskArg *>(arg);
-    int media_sock = marg->media_sock;
-    int rtsp_sock_to_close = marg->rtsp_sock;
-    uint32_t generation = marg->generation;
-    free(marg);
-
-    ESP_LOGI(kTag, "[MEDIA] Task started (sock=%d gen=%lu)",
-             media_sock, (unsigned long)generation);
-
-    // 获取音频 codec（立体声）。
-    if (s_stream_start && !s_stream_start()) {
-        ESP_LOGW(kTag, "[MEDIA] audio session acquire failed");
-    }
-
-    // AAC 解码器。
-    AacDecoderCtx aac;
-    if (!aac.open()) {
-        ESP_LOGE(kTag, "[MEDIA] AAC decoder open failed");
-        if (media_sock != rtsp_sock_to_close) close(media_sock);
-        vTaskDeleteWithCaps(nullptr);
-        return;
-    }
-
-    uint8_t *rtp_buf = static_cast<uint8_t *>(
-        heap_caps_malloc(4096, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (!rtp_buf) {
-        ESP_LOGE(kTag, "[MEDIA] alloc failed");
-        if (media_sock != rtsp_sock_to_close) close(media_sock);
-        aac.close();
-        vTaskDeleteWithCaps(nullptr);
-        return;
-    }
-
-    // SO_RCVBUF + SO_RCVTIMEO。
-    int rcvbuf = 32 * 1024;
-    setsockopt(media_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-    struct timeval tv = {.tv_sec = 0, .tv_usec = 100000};  // 100ms
-    setsockopt(media_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    uint32_t pkt_count = 0, rtp_total = 0, ts_total = 0;
-    TickType_t start_tick = xTaskGetTickCount();
-    TickType_t last_log = start_tick;
-    uint32_t idle_ticks = 0;
-
-    // ADTS 帧跨 TS 包边界时的缓冲（8KB 足够容纳多个 AAC-LC 帧）。
-    constexpr size_t kAdtsBufSize = 8192;
-    uint8_t *adts_buf = static_cast<uint8_t *>(
-        heap_caps_malloc(kAdtsBufSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    size_t adts_buf_used = 0;
-    if (!adts_buf) {
-        ESP_LOGE(kTag, "[MEDIA] adts_buf alloc failed");
-        free(rtp_buf);
-        if (media_sock != rtsp_sock_to_close) close(media_sock);
-        aac.close();
-        vTaskDeleteWithCaps(nullptr);
-        return;
-    }
-
-    while (s_media_generation == generation) {
-        // 每秒日志。
-        if (xTaskGetTickCount() - last_log >= pdMS_TO_TICKS(1000)) {
-            ESP_LOGI(kTag,
-                     "[MEDIA] alive %lus pkts=%lu rtp=%luB idle=%lu",
-                     (unsigned long)((xTaskGetTickCount() - start_tick) /
-                                     configTICK_RATE_HZ),
-                     (unsigned long)pkt_count, (unsigned long)rtp_total,
-                     (unsigned long)idle_ticks);
-            last_log = xTaskGetTickCount();
-        }
-
-        // 读 4 字节 interleaved 帧头：$ + channel + len(u16 BE)。
-        uint8_t hdr[4];
-        int got = 0;
-        while (got < 4) {
-            int n = recv(media_sock, hdr + got, 4 - got, 0);
-            if (n <= 0) {
-                if (n == 0) {
-                    ESP_LOGW(kTag, "[MEDIA] sock closed (n=0) pkts=%lu",
-                             (unsigned long)pkt_count);
-                    goto m_cleanup;
-                }
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    if (s_media_generation != generation) goto m_cleanup;
-                    idle_ticks++;
-                    continue;
-                }
-                ESP_LOGW(kTag, "[MEDIA] recv err errno=%d pkts=%lu", errno,
-                         (unsigned long)pkt_count);
-                goto m_cleanup;
-            }
-            got += n;
-        }
-        if (s_media_generation != generation) break;
-        if (hdr[0] != 0x24) {
-            ESP_LOGW(kTag, "[MEDIA] bad marker 0x%02X", hdr[0]);
-            memmove(hdr, hdr + 1, 3);
-            int n = recv(media_sock, hdr + 3, 1, 0);
-            if (n <= 0) goto m_cleanup;
-            if (hdr[0] != 0x24) continue;
-        }
-
-        uint16_t rtp_len = (static_cast<uint16_t>(hdr[2]) << 8) | hdr[3];
-        if (rtp_len < 12 || rtp_len > 4096) {
-            ESP_LOGW(kTag, "[MEDIA] bad RTP len: %u", rtp_len);
-            continue;
-        }
-
-        got = 0;
-        while (got < rtp_len) {
-            int n = recv(media_sock, rtp_buf + got, rtp_len - got, 0);
-            if (n > 0) {
-                got += n;
-                continue;
-            }
-            if (n == 0) {
-                ESP_LOGW(kTag, "[MEDIA] body FIN pkts=%lu",
-                         (unsigned long)pkt_count);
-                goto m_cleanup;
-            }
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                if (s_media_generation != generation) goto m_cleanup;
-                idle_ticks++;
-                continue;
-            }
-            ESP_LOGW(kTag, "[MEDIA] body recv err errno=%d", errno);
-            goto m_cleanup;
-        }
-        rtp_total += rtp_len;
-        pkt_count++;
-        s_media_pkt_total = pkt_count;
-        if (pkt_count <= 3) {
-            ESP_LOGI(kTag,
-                     "[MEDIA] RTP#%lu len=%u first=[%02X %02X %02X %02X]",
-                     (unsigned long)pkt_count, rtp_len, rtp_buf[0], rtp_buf[1],
-                     rtp_buf[2], rtp_buf[3]);
-        }
-
-        // 剥 RTP 头，提取 TS 载荷。
-        uint8_t *ts_data = rtp_buf;
-        uint32_t ts_len = rtp_len;
-        if ((rtp_buf[0] & 0xC0) == 0x80) {
-            int hdr_len = 12 + (rtp_buf[0] & 0x0F) * 4;
-            if (rtp_buf[0] & 0x10) {
-                if (hdr_len + 4 <= static_cast<int>(rtp_len)) {
-                    int ext_words =
-                        (static_cast<uint16_t>(rtp_buf[hdr_len + 2]) << 8) |
-                        rtp_buf[hdr_len + 3];
-                    hdr_len += 4 + ext_words * 4;
-                }
-            }
-            int end = rtp_len;
-            if (rtp_buf[0] & 0x20) {
-                end -= rtp_buf[rtp_len - 1];
-            }
-            if (hdr_len < end) {
-                ts_data = rtp_buf + hdr_len;
-                ts_len = end - hdr_len;
-            }
-        }
-
-        // PES 解密（streamKey 已交换时）。
-        if (s_has_stream_key) {
-            decrypt_ts_media(ts_data, ts_len);
-        }
-
-        // TS demux + AAC 解码。
-        // 策略：扫描 TS 包，提取 PID=0x1100 的 PES 音频数据，
-        // 追加到 adts_buf，扫描完整 ADTS 帧解码。
-        // adts_buf 在循环外分配，跨 TS 包保持未消费数据。
-        for (size_t off = 0; off + kTsPktSize <= ts_len; off += kTsPktSize) {
-            uint8_t *pkt = ts_data + off;
-            if (pkt[0] != kTsSyncByte) continue;
-            uint16_t pid =
-                (static_cast<uint16_t>(pkt[1] & 0x1F) << 8) | pkt[2];
-            if (pid != kTargetPid) continue;
-            uint8_t afc = (pkt[3] >> 4) & 0x03;
-            if (afc == 0 || afc == 2) continue;
-            bool pusi = (pkt[1] & 0x40) != 0;
-            int pay_off = 4;
-            if (afc == 3) {
-                pay_off = 5 + pkt[4];
-            }
-            int pay_len = kTsPktSize - pay_off;
-            if (pay_len <= 0) continue;
-
-            // 提取 PES 音频数据。
-            const uint8_t *audio_data = pkt + pay_off;
-            int audio_len = pay_len;
-            if (pusi && pay_len >= 9 && pkt[pay_off] == 0 &&
-                pkt[pay_off + 1] == 0 && pkt[pay_off + 2] == 1 &&
-                pkt[pay_off + 3] == 0xC0) {
-                // 新 PES 包：跳过 PES 头。
-                int hdr_len = 9 + pkt[pay_off + 8];
-                if (hdr_len >= pay_len) {
-                    adts_buf_used = 0;  // 整个 TS 包都是 PES 头，重置
-                    continue;
-                }
-                audio_data = pkt + pay_off + hdr_len;
-                audio_len = pay_len - hdr_len;
-                // 新 PES 开始时不清空 adts_buf（可能有上一帧尾部）。
-            }
-
-            // 追加到 ADTS 缓冲。
-            if (audio_len > 0 &&
-                adts_buf_used + audio_len <= kAdtsBufSize) {
-                memcpy(adts_buf + adts_buf_used, audio_data, audio_len);
-                adts_buf_used += audio_len;
-            }
-
-            // 扫描并解码完整 ADTS 帧。
-            int scan_off = 0;
-            while (scan_off + 7 <= adts_buf_used) {
-                // 找 ADTS 同步字。
-                if (adts_buf[scan_off] != 0xFF ||
-                    (adts_buf[scan_off + 1] & 0xF6) != 0xF0) {
-                    scan_off++;
-                    continue;
-                }
-                uint16_t frame_len =
-                    (static_cast<uint16_t>(adts_buf[scan_off + 3] & 0x03) << 11) |
-                    (static_cast<uint16_t>(adts_buf[scan_off + 4]) << 3) |
-                    (static_cast<uint16_t>(adts_buf[scan_off + 5] >> 5));
-                if (frame_len < 7) { scan_off++; continue; }
-                if (scan_off + frame_len > adts_buf_used) break;  // 不完整
-                aac.decode_and_play(adts_buf + scan_off, frame_len);
-                scan_off += frame_len;
-            }
-            // 移除已消费数据。
-            if (scan_off > 0 && scan_off < adts_buf_used) {
-                memmove(adts_buf, adts_buf + scan_off,
-                        adts_buf_used - scan_off);
-                adts_buf_used -= scan_off;
-            } else if (scan_off >= adts_buf_used) {
-                adts_buf_used = 0;
-            }
-        }
-
-        ts_total += ts_len;
-        if (pkt_count % 100 == 1) {
-            ESP_LOGI(kTag, "[MEDIA] pkts=%lu rtp=%luKB ts=%luKB",
-                     (unsigned long)pkt_count,
-                     (unsigned long)(rtp_total / 1024),
-                     (unsigned long)(ts_total / 1024));
-        }
-    }
-
-m_cleanup:
-    if (s_media_generation != generation) {
-        ESP_LOGI(kTag, "[MEDIA] Stale session cleanup, skip stop callback");
-    }
-    aac.close();
-    if (s_stream_stop) {
-        s_stream_stop();
-    }
-    free(adts_buf);
-    free(rtp_buf);
-    close(media_sock);
-    // 避免双重关闭同一个 fd。
-    if (rtsp_sock_to_close >= 0 && rtsp_sock_to_close != media_sock) {
-        ESP_LOGW(kTag, "[MEDIA] closing rtsp_sock=%d", rtsp_sock_to_close);
-        close(rtsp_sock_to_close);
-    }
-    ESP_LOGI(kTag, "[MEDIA] Task ended, %lu pkts, %luKB rtp, %luKB ts",
-             (unsigned long)pkt_count, (unsigned long)(rtp_total / 1024),
-             (unsigned long)(ts_total / 1024));
-    vTaskDeleteWithCaps(nullptr);
-}
+// media_receive_task 已删除（死代码）：统一 PLAY 循环（miplay_rtsp_run）
+// 早已取代了独立的媒体接收任务。编译器警告 defined but not used 是判据。
+// 删除省 ~280 行 Flash 与一个永不执行的 8KB adts_buf 分配路径。
 
 // ── Image drain 任务 ──
 // 手机在数据 socket 上发的 image 数据（缩略图/封面），RLCD 不需要，直接丢弃。
@@ -958,6 +679,12 @@ void miplay_rtsp_run(const char *host, int port, int client_sock,
     int image_sock = -1;
     int multi_sock = -1;
     uint16_t image_port = 0;
+    // 握手阶段总预算。SO_RCVTIMEO=2s 是单次读超时，不是会话超时——
+    // 手机侧做能力协商时偶尔会停顿 2-5 秒，把单次 EAGAIN 当致命错误
+    // 会把健康会话拆掉（实测 gen2 就是这样死的）。总预算兜住"永远不回来"。
+    // 声明必须在任何 goto rtsp_cleanup 之前（C++ 禁止 goto 跨过初始化）。
+    constexpr int kHandshakeBudgetSec = 30;
+    int handshake_elapsed = 0;
     uint16_t multi_port = 0;
     struct timeval tv_recv = {.tv_sec = 2};
 
@@ -1029,12 +756,26 @@ void miplay_rtsp_run(const char *host, int port, int client_sock,
     rtsp_read_msg_reset();
 
     while (s_media_generation == generation && rtsp_state < 2) {
+        if (handshake_elapsed >= kHandshakeBudgetSec) {
+            ESP_LOGW(kTag, "[RTSP] handshake budget exhausted (%ds)",
+                     kHandshakeBudgetSec);
+            break;
+        }
         ESP_LOGI(kTag, "[RTSP] Waiting for msg (state=%d)...", rtsp_state);
         int ret = rtsp_read_msg(rtsp_sock, headers, kRtspBufSize,
                                 body, kRtspBufSize, &body_len);
         if (ret <= 0) {
-            if (ret == 0) ESP_LOGI(kTag, "[RTSP] Disconnected");
-            else ESP_LOGW(kTag, "[RTSP] Read error (errno=%d)", errno);
+            if (ret == 0) {
+                ESP_LOGI(kTag, "[RTSP] Disconnected");
+                break;
+            }
+            // EAGAIN/EWOULDBLOCK = 单次读超时，不是致命错误。手机可能正在
+            // 做内部协商，多等一轮即可。真正的错误（ECONNRESET 等）才退出。
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                handshake_elapsed += 2;  // tv_recv = 2s
+                continue;
+            }
+            ESP_LOGW(kTag, "[RTSP] Read error (errno=%d)", errno);
             break;
         }
         ESP_LOGI(kTag, "[RTSP] Got msg (%d bytes)", ret);
@@ -1327,7 +1068,7 @@ void miplay_rtsp_run(const char *host, int port, int client_sock,
         // RTP/ADTS 缓冲区（PSRAM）。
         uint8_t *rtp_buf = static_cast<uint8_t *>(
             heap_caps_malloc(4096, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-        constexpr size_t kAdtsBufSize = 8192;
+        constexpr size_t kAdtsBufSize = 16384;
         uint8_t *adts_buf = static_cast<uint8_t *>(
             heap_caps_malloc(kAdtsBufSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
         if (!rtp_buf || !adts_buf) {
@@ -1381,6 +1122,8 @@ void miplay_rtsp_run(const char *host, int port, int client_sock,
             if (multi_sock >= 0 && nfds >= 2 && (pfds[1].revents & POLLIN)) {
                 uint8_t ka_first;
                 int ka_pn = recv(rtsp_sock, &ka_first, 1, MSG_PEEK);
+                if (ka_pn < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                    continue;
                 if (ka_pn <= 0) {
                     ESP_LOGW(kTag, "[PLAY] rtsp sock closed");
                     break;
@@ -1416,9 +1159,12 @@ void miplay_rtsp_run(const char *host, int port, int client_sock,
                     ESP_LOGW(kTag, "[PLAY] sock closed, pkts=%lu ka=%lu",
                              (unsigned long)pkt_count,
                              (unsigned long)keepalive_count);
-                } else {
-                    ESP_LOGW(kTag, "[PLAY] peek err errno=%d", errno);
+                    break;
                 }
+                // EAGAIN：poll 声称有数据但 recv 还没就绪（lwIP 竞态），
+                // 不是致命错误。回到 poll 循环再等一轮。
+                if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                ESP_LOGW(kTag, "[PLAY] peek err errno=%d", errno);
                 break;
             }
 
@@ -1506,27 +1252,6 @@ void miplay_rtsp_run(const char *host, int port, int client_sock,
                 }
 
                 // 一次性诊断：打印剥头后前 16 字节与 TS 匹配统计。
-                if (pkt_count == 4) {
-                    ESP_LOGW(kTag, "[DIAG] ts_len=%u has_key=%d first16="
-                                   "%02X %02X %02X %02X %02X %02X %02X %02X "
-                                   "%02X %02X %02X %02X %02X %02X %02X %02X",
-                             (unsigned)ts_len, (int)s_has_stream_key,
-                             ts_data[0], ts_data[1], ts_data[2], ts_data[3],
-                             ts_data[4], ts_data[5], ts_data[6], ts_data[7],
-                             ts_data[8], ts_data[9], ts_data[10], ts_data[11],
-                             ts_data[12], ts_data[13], ts_data[14], ts_data[15]);
-                    int ts_ok = 0, pid_ok = 0;
-                    for (size_t o = 0; o + kTsPktSize <= ts_len; o += kTsPktSize) {
-                        if (ts_data[o] == kTsSyncByte) {
-                            ts_ok++;
-                            uint16_t p = ((uint16_t)(ts_data[o+1] & 0x1F) << 8) | ts_data[o+2];
-                            if (p == kTargetPid) pid_ok++;
-                        }
-                    }
-                    ESP_LOGW(kTag, "[DIAG] ts_pkts=%d pid_1100=%d adts_used=%u",
-                             ts_ok, pid_ok, (unsigned)adts_buf_used);
-                }
-
                 // TS demux → ADTS → AAC 解码。
                 for (size_t off = 0; off + kTsPktSize <= ts_len;
                      off += kTsPktSize) {
@@ -1587,29 +1312,9 @@ void miplay_rtsp_run(const char *host, int port, int client_sock,
                             continue;
                         }
                         if (scan_off + frame_len > adts_buf_used) break;
-                        {
-                            static int s_adts_diag = 0;
-                            if (s_adts_diag < 3) {
-                                s_adts_diag++;
-                                ESP_LOGW(kTag, "[DIAG] ADTS frame #%d: "
-                                               "off=%d len=%u total=%u",
-                                         s_adts_diag, scan_off,
-                                         (unsigned)frame_len,
-                                         (unsigned)adts_buf_used);
-                            }
-                        }
                         aac.decode_and_play(adts_buf + scan_off, frame_len);
                         frames_found++;
                         scan_off += frame_len;
-                    }
-                    if (pkt_count == 4 && frames_found == 0 && adts_buf_used > 0) {
-                        ESP_LOGW(kTag, "[DIAG] adts_buf head: "
-                                       "%02X %02X %02X %02X %02X %02X %02X %02X "
-                                       "(used=%u, no ADTS sync)",
-                                 adts_buf[0], adts_buf[1], adts_buf[2],
-                                 adts_buf[3], adts_buf[4], adts_buf[5],
-                                 adts_buf[6], adts_buf[7],
-                                 (unsigned)adts_buf_used);
                     }
                     if (scan_off > 0 && scan_off < adts_buf_used) {
                         memmove(adts_buf, adts_buf + scan_off,
@@ -1868,6 +1573,10 @@ void miplay_media_set_stream_key(const uint8_t *payload, uint32_t plen)
             memcpy(s_stream_key, sk, 16);
             memcpy(s_stream_iv, siv, 16);
             s_has_stream_key = true;
+            // 新密钥意味着新流：上一轮遗留的 PES 解密游标必须丢弃，
+            // 否则新流第一个 PES 的载荷会被按旧 IV/旧 remaining 解，
+            // 输出一段确定错误的明文。
+            s_pes_dec = {};
             ESP_LOGI(kTag, "SetMirrorKey: streamKey=%.16s streamIV=%.16s",
                      s_stream_key, s_stream_iv);
         }
@@ -1948,6 +1657,7 @@ void miplay_media_stop()
     s_media_generation++;
     s_has_stream_key = false;
     s_has_mirror_auth_key = false;
+    s_pes_dec = {};
     s_media_pkt_total = 0;
     rtsp_read_msg_reset();
     ESP_LOGI(kTag, "[MEDIA] Stopped (gen -> %lu)",
