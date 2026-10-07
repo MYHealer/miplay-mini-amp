@@ -23,15 +23,15 @@ menu "MiPlay Mini Amp"
         config MIPLAY_I2S_BCLK_GPIO
             int "BCLK GPIO"
             range 0 48
-            default 8
+            default 12
         config MIPLAY_I2S_LRCK_GPIO
             int "LRCK (WS) GPIO"
             range 0 48
-            default 7
+            default 10
         config MIPLAY_I2S_DIN_GPIO
             int "DIN (SDATA) GPIO"
             range 0 48
-            default 6
+            default 11
 
         config MIPLAY_I2S_ENABLE_MCLK
             bool "Output MCLK to PCM5102A"
@@ -53,7 +53,7 @@ menu "MiPlay Mini Amp"
             int "MCLK GPIO"
             depends on MIPLAY_I2S_ENABLE_MCLK
             range 0 48
-            default 9
+            default 13
     endmenu
 
     menu "Audio"

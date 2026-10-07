@@ -24,16 +24,16 @@ namespace {
 constexpr char kTag[] = "audio_i2s";
 
 #ifndef CONFIG_MIPLAY_I2S_BCLK_GPIO
-#define CONFIG_MIPLAY_I2S_BCLK_GPIO 8
+#define CONFIG_MIPLAY_I2S_BCLK_GPIO 12
 #endif
 #ifndef CONFIG_MIPLAY_I2S_LRCK_GPIO
-#define CONFIG_MIPLAY_I2S_LRCK_GPIO 7
+#define CONFIG_MIPLAY_I2S_LRCK_GPIO 10
 #endif
 #ifndef CONFIG_MIPLAY_I2S_DIN_GPIO
-#define CONFIG_MIPLAY_I2S_DIN_GPIO 6
+#define CONFIG_MIPLAY_I2S_DIN_GPIO 11
 #endif
 #ifndef CONFIG_MIPLAY_I2S_MCLK_GPIO
-#define CONFIG_MIPLAY_I2S_MCLK_GPIO 9
+#define CONFIG_MIPLAY_I2S_MCLK_GPIO 13
 #endif
 
 // DMA 描述符 × 帧数。参考 esp-miply-1.85touch：12 × 512 ≈ 128ms。
