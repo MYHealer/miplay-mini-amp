@@ -56,10 +56,9 @@ extern "C" {
 // MIPLAY_DEV 决定手机妙播列表里的设备类型图标：
 //   1=手机  2=电视  3=电脑  4=音箱  5=车
 //   6/7/8 未映射，手机端回落成「蓝牙喇叭」
-// ⚠ 必须用 2（电视）：dev=4 时手机搜得到（_miplay_lan 有应答）
-//   但**不进妙播投屏列表**。v1.0 实机验证即 dev=2。
-#define MIPLAY_DEV     "2"
-#define MIPLAY_SEC     "2"
+// 用户选择 4（音箱）：显示为音箱。若投屏列表消失再切回 2（电视）。
+#define MIPLAY_DEV     "4"
+#define MIPLAY_SEC     "4"
 #define MIPLAY_VERSION "196608"  // 0x30000
 
 // ── 组播地址 ──

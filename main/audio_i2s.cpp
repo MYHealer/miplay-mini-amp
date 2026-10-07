@@ -1,10 +1,9 @@
 // I2S 音频输出。
 //
-// 架构：解码 → 环形缓冲 → I2S 输出任务（两段解耦）。
-//   audio_i2s_write() 只做"音量缩放 + 压入环形缓冲"，0 超时不阻塞。
-//   i2s_output_task() 专职从环读数据写硬件，采样率切换也在这里做。
-//   网络收包/解码永远不会被 I2S 阻塞——这是低延迟的关键。
-//   环满时丢帧（实时音频宁丢帧不延迟）。
+// 架构：解码 → 环形缓冲 → I2S 输出任务（双任务解耦，参考 esp-miply-1.85touch）。
+//   audio_i2s_write() 只做音量 + 压环，0 超时不阻塞（解码/网络永不被 I2S 卡住）。
+//   i2s_output_task() 专职从环读 + 写 DMA + 切采样率，阻塞只在输出侧。
+//   环满丢帧（实时音频宁丢帧不延迟），环足够深（约 200ms）吸收网络抖动。
 
 #include "audio_i2s.h"
 
@@ -37,27 +36,30 @@ constexpr char kTag[] = "audio_i2s";
 #define CONFIG_MIPLAY_I2S_MCLK_GPIO 9
 #endif
 
-// DMA 描述符 × 帧数。12 × 512 帧 ≈ 128ms @48kHz 立体声。
+// DMA 描述符 × 帧数。参考 esp-miply-1.85touch：12 × 512 ≈ 128ms。
 constexpr int kDmaDescNum = 12;
 constexpr int kDmaFrameNum = 512;
 
-// 环形缓冲。NOSPLIT 类型保证"一次 send 对应一次 receive"。
-// NOSPLIT 会把容量对半取整：32KB 请求 → ~16KB 实际。
-// 16KB ÷ ~4KB/item ≈ 4 项 ≈ 84ms 缓冲深度。够用且省内存。
-constexpr size_t kRingBufBytes = 32 * 1024;
+// 环形缓冲（PSRAM）。NOSPLIT：一次 send 对应一次 receive。
+// 128KB 请求 → ~64KB 实际 ≈ 16 个 AAC 帧（每帧 ~4KB）≈ 16×21ms ≈ 340ms。
+// 足够吸收网络抖动，环满只丢帧不延迟。
+constexpr size_t kRingBufBytes = 128 * 1024;
 
-// 输出任务栈：含 i2s_channel_write 内部调用链，给足 8KB。
+// 输出任务栈：含 i2s_channel_write 调用链，8KB 足够。
 constexpr uint32_t kOutTaskStack = 8192;
+// 输出任务优先级：6 高于网络(4)，保证 DMA 不饿死。
+constexpr UBaseType_t kOutTaskPriority = 6;
 
 i2s_chan_handle_t s_tx = nullptr;
 uint32_t s_sample_rate = 0;
 
 RingbufHandle_t s_ring = nullptr;
 StaticRingbuffer_t s_ring_struct = {};
+uint8_t *s_ring_storage = nullptr;
 TaskHandle_t s_out_task = nullptr;
 volatile bool s_out_running = false;
 
-// 写入环的 item 格式：[int32 rate][int32 channels][int16 pcm × N]
+// 环 item 格式：[int32 rate][int32 channels][int16 pcm × N]
 struct ItemHeader {
     int32_t rate;
     int32_t channels;
@@ -72,24 +74,23 @@ void fill_std_config(i2s_std_config_t *cfg, uint32_t sample_rate)
     cfg->gpio_cfg.bclk = (gpio_num_t)CONFIG_MIPLAY_I2S_BCLK_GPIO;
     cfg->gpio_cfg.ws = (gpio_num_t)CONFIG_MIPLAY_I2S_LRCK_GPIO;
     cfg->gpio_cfg.dout = (gpio_num_t)CONFIG_MIPLAY_I2S_DIN_GPIO;
-    cfg->gpio_cfg.mclk = I2S_GPIO_UNUSED;
+    // SCK 接 GPIO 9：从这里输出 MCLK 给 DAC。
+    cfg->gpio_cfg.mclk = (gpio_num_t)CONFIG_MIPLAY_I2S_MCLK_GPIO;
     cfg->gpio_cfg.invert_flags = {};
 }
 
-// I2S 输出任务：从环读 → 写 DMA。采样率切换在此完成。
+// I2S 输出任务：从环读 → 写 DMA。
 void i2s_output_task(void *)
 {
-    // 内部 DMA RAM 中转缓冲。I2S GDMA 不能可靠读 PSRAM，拷一次确保正确。
+    // 内部 DMA RAM 中转。GDMA 不能可靠读 PSRAM，拷一次确保正确。
     static int16_t *s_stage = nullptr;
     static size_t s_stage_cap = 0;
 
     while (s_out_running) {
         size_t item_size = 0;
-        void *item = xRingbufferReceive(s_ring, &item_size, pdMS_TO_TICKS(100));
+        void *item = xRingbufferReceive(s_ring, &item_size, pdMS_TO_TICKS(50));
         if (item == nullptr) continue;
-
-        if (item_size < sizeof(ItemHeader) ||
-            s_tx == nullptr) {
+        if (item_size < sizeof(ItemHeader) || s_tx == nullptr) {
             vRingbufferReturnItem(s_ring, item);
             continue;
         }
@@ -98,10 +99,9 @@ void i2s_output_task(void *)
         const auto *pcm = reinterpret_cast<const int16_t *>(
             static_cast<const uint8_t *>(item) + sizeof(ItemHeader));
         const size_t samples = (item_size - sizeof(ItemHeader)) / sizeof(int16_t);
-        const size_t frame_count = (hdr->channels >= 2) ? samples / 2 : samples;
         const size_t bytes = samples * sizeof(int16_t);
 
-        // 采样率切换。
+        // 采样率切换（在输出任务内，不阻塞解码）。
         if (hdr->rate > 0 && (uint32_t)hdr->rate != s_sample_rate) {
             const auto rate = static_cast<uint32_t>(hdr->rate);
             i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(rate);
@@ -115,28 +115,25 @@ void i2s_output_task(void *)
         }
 
         // 内部 DMA RAM 中转。
-        const size_t need = samples;
-        if (need > s_stage_cap) {
+        if (samples > s_stage_cap) {
             int16_t *grown = static_cast<int16_t *>(
-                heap_caps_malloc(need * sizeof(int16_t),
+                heap_caps_malloc(samples * sizeof(int16_t),
                                  MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
             if (grown != nullptr) {
                 heap_caps_free(s_stage);
                 s_stage = grown;
-                s_stage_cap = need;
+                s_stage_cap = samples;
             }
         }
 
         const void *src = pcm;
-        if (s_stage != nullptr && need <= s_stage_cap) {
+        if (s_stage != nullptr && samples <= s_stage_cap) {
             memcpy(s_stage, pcm, bytes);
             src = s_stage;
         }
 
-        size_t written = 0;
-        // 输出侧用正常阻塞（200ms）：DMA 满是正常的，等它腾出空间。
-        // 这里阻塞不影响网络——只有这个输出任务在等。
-        i2s_channel_write(s_tx, src, bytes, &written, pdMS_TO_TICKS(200));
+        // 阻塞写：DMA 满就等，这里阻塞不影响解码/网络。
+        i2s_channel_write(s_tx, src, bytes, nullptr, pdMS_TO_TICKS(200));
 
         vRingbufferReturnItem(s_ring, item);
     }
@@ -153,30 +150,23 @@ bool audio_i2s_stream_start(void)
         return true;
     }
 
-    // GPIO 9 接 PCM5102A SCK（已接地）。驱动为低电平。
-    gpio_config_t io = {};
-    io.pin_bit_mask = 1ULL << CONFIG_MIPLAY_I2S_MCLK_GPIO;
-    io.mode = GPIO_MODE_OUTPUT;
-    io.pull_up_en = GPIO_PULLUP_DISABLE;
-    io.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    io.intr_type = GPIO_INTR_DISABLE;
-    gpio_config(&io);
-    gpio_set_level((gpio_num_t)CONFIG_MIPLAY_I2S_MCLK_GPIO, 0);
-
-    // 创建环形缓冲（仅首次）。存储区放 PSRAM，省内部 SRAM 给 Wi-Fi/I2S DMA。
+    // 环形缓冲（仅首次，PSRAM）。
     if (s_ring == nullptr) {
-        auto *storage = static_cast<uint8_t *>(
-            heap_caps_malloc(kRingBufBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-        if (storage == nullptr) {
+        s_ring_storage = static_cast<uint8_t *>(
+            heap_caps_malloc(kRingBufBytes,
+                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (s_ring_storage == nullptr) {
             ESP_LOGE(kTag, "ring storage alloc failed (%u B from PSRAM)",
                      (unsigned)kRingBufBytes);
             return false;
         }
-        s_ring = xRingbufferCreateStatic(kRingBufBytes, RINGBUF_TYPE_NOSPLIT,
-                                         storage, &s_ring_struct);
+        s_ring = xRingbufferCreateStatic(
+            kRingBufBytes, RINGBUF_TYPE_NOSPLIT, s_ring_storage,
+            &s_ring_struct);
         if (s_ring == nullptr) {
             ESP_LOGE(kTag, "ring buffer create failed");
-            heap_caps_free(storage);
+            heap_caps_free(s_ring_storage);
+            s_ring_storage = nullptr;
             return false;
         }
         ESP_LOGI(kTag, "ring buffer ready: %u B (PSRAM, NOSPLIT)",
@@ -217,12 +207,10 @@ bool audio_i2s_stream_start(void)
 
     s_sample_rate = 48000;
 
-    // 启动输出任务。
-    // 输出任务优先级 6 > 网络任务(4)：必须优先喂 I2S DMA，
-    // 否则 DMA 饿死 → 一个字卡一下。
+    // 输出任务。
     s_out_running = true;
-    if (xTaskCreate(i2s_output_task, "i2s_out", kOutTaskStack, nullptr, 6,
-                    &s_out_task) != pdPASS) {
+    if (xTaskCreate(i2s_output_task, "i2s_out", kOutTaskStack, nullptr,
+                    kOutTaskPriority, &s_out_task) != pdPASS) {
         ESP_LOGE(kTag, "output task create failed");
         s_out_running = false;
         i2s_channel_disable(s_tx);
@@ -231,11 +219,11 @@ bool audio_i2s_stream_start(void)
         return false;
     }
 
-    ESP_LOGI(kTag, "stream started: BCLK=%d LRCK=%d DIN=%d "
-                   "(ring=%u B, DMA %dx%d, SCK GND PLL)",
+    ESP_LOGI(kTag, "stream started: BCLK=%d LRCK=%d DIN=%d MCLK=%d "
+                   "(ring=%u B, DMA %dx%d, MCLK->SCK)",
              CONFIG_MIPLAY_I2S_BCLK_GPIO, CONFIG_MIPLAY_I2S_LRCK_GPIO,
-             CONFIG_MIPLAY_I2S_DIN_GPIO, (unsigned)kRingBufBytes,
-             kDmaDescNum, kDmaFrameNum);
+             CONFIG_MIPLAY_I2S_DIN_GPIO, CONFIG_MIPLAY_I2S_MCLK_GPIO,
+             (unsigned)kRingBufBytes, kDmaDescNum, kDmaFrameNum);
     return true;
 }
 
@@ -244,8 +232,7 @@ void audio_i2s_stream_stop(void)
     if (s_tx == nullptr) return;
 
     s_out_running = false;
-    // 等输出任务退出（它最多阻塞 200ms）。
-    vTaskDelay(pdMS_TO_TICKS(300));
+    vTaskDelay(pdMS_TO_TICKS(300));  // 等输出任务退出
     s_out_task = nullptr;
 
     i2s_channel_disable(s_tx);
@@ -253,7 +240,7 @@ void audio_i2s_stream_stop(void)
     s_tx = nullptr;
     s_sample_rate = 0;
 
-    // 清空环中残留。
+    // 清空环残留。
     if (s_ring != nullptr) {
         size_t sz;
         void *item;
@@ -264,7 +251,6 @@ void audio_i2s_stream_stop(void)
     ESP_LOGI(kTag, "stream stopped, channel released");
 }
 
-// 解码侧调用：压入环形缓冲，0 超时不阻塞。环满丢帧。
 int audio_i2s_write(const int16_t *stereo_samples, size_t frame_count,
                     int sample_rate)
 {
@@ -272,11 +258,10 @@ int audio_i2s_write(const int16_t *stereo_samples, size_t frame_count,
         return -1;
     }
 
-    // 软件音量（在压入环之前做，输出任务不需要关心音量）。
+    // 软件音量。
     app_volume_apply(const_cast<int16_t *>(stereo_samples), frame_count * 2);
 
-    // 组装 item：header + PCM。用栈上临时缓冲——frame_count 最大 1024
-    // × 2ch × 2B = 4KB + 8B header，栈深度 6KB 足够。
+    // 组装 item：header + PCM（栈上缓冲）。
     const size_t pcm_bytes = frame_count * 2 * sizeof(int16_t);
     const size_t item_size = sizeof(ItemHeader) + pcm_bytes;
 
@@ -290,7 +275,7 @@ int audio_i2s_write(const int16_t *stereo_samples, size_t frame_count,
 
     // 0 超时：环满立即丢帧返回，绝不阻塞解码/网络。
     if (xRingbufferSend(s_ring, stack_buf, item_size, 0) != pdTRUE) {
-        return 0;  // 丢帧，下帧追上
+        return 0;  // 丢帧
     }
     return 0;
 }
