@@ -133,6 +133,9 @@ esptool --chip esp32s3 -p COM18 -b 460800 \
 ### 方式二：从源码构建
 
 ```bash
+# 0) 克隆（构建目录必须是纯 ASCII 路径，别放中文目录）
+git clone https://github.com/MYHealer/miplay-mini-amp.git E:\ESP\miplay-mini-amp
+
 # 1) 编译
 cd E:\ESP && . .\esp_env.ps1
 cd E:\ESP\miplay-mini-amp
