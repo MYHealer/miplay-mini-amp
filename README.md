@@ -67,23 +67,6 @@ ESP32-S3 SuperMini ──I2S──▶ GY-PCM5102 ──▶ 3.5mm 耳机
 > 引脚在 `menuconfig → MiPlay Mini Amp → I2S / PCM5102A` 可改，无需动代码。
 > 下表 GPIO 号即 `sdkconfig` 里的固化值。
 
-**MCLK 说明（重要）**
-
-GY-PCM5102 在市面有两种流通版本，外观无法区分：
-
-- **SCK 焊盘悬空** → **必须**由主控喂 MCLK，否则完全无声。**本工程按这一版接线**，
-  `MIPLAY_I2S_ENABLE_MCLK` 默认已打开，GPIO13 接模块 SCK。
-- **SCK 焊盘已接地** → PCM5102A 用内部 PLL 从 BCK 锁相，**不需要 MCLK**。
-  此时若仍把 GPIO13 接上去，等于输出脚对地短路，必须关闭
-  `MIPLAY_I2S_ENABLE_MCLK` 并断开这条线。
-
-**怎么判断手上是哪一版**：万用表量 SCK 焊盘对 GND —— 开路是悬空版（保持默认），
-接近 0Ω 是接地版（关掉 MCLK 开关、不接这根线）。
-
-**避开**：GPIO19/20（USB-JTAG，日志就靠它）、GPIO0/3/45/46（strapping）、
-GPIO26-32（片内 Flash/PSRAM 占用）。当前用的 10-13 全部落在 P2 区（无限制）。
-
----
 
 ## 2. 快速上手
 
@@ -257,7 +240,7 @@ cd E:\ESP\miplay-mini-amp
 | `MIPLAY_I2S_BCLK_GPIO` | 12 | |
 | `MIPLAY_I2S_LRCK_GPIO` | 10 | |
 | `MIPLAY_I2S_DIN_GPIO` | 11 | |
-| `MIPLAY_I2S_ENABLE_MCLK` | **y** | 本工程按 SCK 悬空版接线。若模块 SCK 已接地必须关掉 |
+| `MIPLAY_I2S_ENABLE_MCLK` | **y** |
 | `MIPLAY_I2S_MCLK_GPIO` | 13 | 接模块 SCK 焊盘 |
 | `MIPLAY_DEFAULT_VOLUME` | 70 | PCM5102A 无 I2C 口，音量是软件缩放 |
 | `MIPLAY_LED_ENABLE` | y | 板子没灯就关掉 |
@@ -722,11 +705,7 @@ inst_name = "<显示名>(<10 字符哈希后缀>)"   → 存入 s_inst_name[40]
 | [mbedtls](https://github.com/Mbed-TLS/mbedtls) | TrustedFirmware | SHA-256 与 AES-128-CBC |
 | IDF `captive_portal` 示例 | Espressif Systems | 强制门户的 DNS 劫持组件（`components/dns_server/`） |
 
-### 协议实现致谢
-
-- **小米妙播（MiPlay）** 的协议细节来自对官方客户端与固件的逆向分析，
-  以及社区项目 [FusionPlay](https://github.com/rosienosiesie/FusionPlay-Android)
-  公开的 Rust 实现。感谢这些工作为设备标识符与发现流程提供了关键证据链。
+### 实现致谢
 - 感谢**小米互通互联的协议**与**乐鑫 ESP32 芯片**的性能，
   以及**立创开源硬件平台**的包容开放。
 
