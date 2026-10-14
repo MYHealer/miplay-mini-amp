@@ -1,8 +1,12 @@
 # MiPlay Mini Amp — 小米妙播最小耳放
 
-**版本 v1.0**（2026-09-28，实机验证：配网 + 投屏 + 出声全通）
+[![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
+[![ESP-IDF](https://img.shields.io/badge/ESP--IDF-v5.5.4-red.svg)](https://docs.espressif.com/projects/esp-idf/)
+[![Platform](https://img.shields.io/badge/chip-ESP32--S3-green.svg)](https://www.espressif.com/)
+[![Cost](https://img.shields.io/badge/成本-约20元-orange.svg)](#2-快速上手)
 
-把 ESP32-S3 SuperMini + GY-PCM5102 做成一个**只做小米妙播接收播放**的耳放。
+**用小米妙播（MiPlay）协议做的最小音频耳放系统板。** 仅供开发者学习小米原生
+协议使用——不是小米音箱、不是小爱音箱，**只有内核协议，没有功放电路和外壳**。
 
 ```
 小米手机「妙播」
@@ -15,8 +19,29 @@ ESP32-S3 SuperMini ──I2S──▶ GY-PCM5102 ──▶ 3.5mm 耳机
 
 **不做**：屏幕、DLNA、airkan 遥控、歌词封面、OTA、按键。
 
-> Wi-Fi 凭据**不在编译期硬编码**：首次开机无凭据即开 AP + 强制门户，
-> 手机连上自动弹配网页，选网络填密码，连上后 AP 自动关闭（见 §3.1）。
+> **为什么要做这个**：仅需 **约 20 元成本**，就能学习开发小米妙播协议，
+> 最终可移植到其他音频设备，得到属于极客玩家自己的"小米音箱"。
+> 也方便现在和将来的小米工程师熟悉妙播协议的开发。
+>
+> **这是一次小小的尝试。** 感谢小米互通互联的协议，感谢乐鑫 ESP32 芯片的性能，
+> 也感谢立创开源硬件平台的包容开放。希望三方在 AI 硬件的方向上通过不断交流沟通，
+> 共同建立起更加生机蓬勃的 AI 硬件开发生态——让科技的乐趣落到每一个家庭、
+> 每一个个人，让科技平权。
+
+> ⚠ **本项目仅供学习与个人研究使用，禁止商用与售卖。** 与小米公司无隶属关系。
+> 完整条款见文末 [免责声明](#免责声明) 与 [许可证](#许可证)。
+
+---
+
+## 项目亮点
+
+| 特性 | 说明 |
+|---|---|
+| **零编译期凭据** | Wi-Fi 密码不进源码、不进 sdkconfig。首次开机开 AP + 强制门户，手机弹窗填密码（见 §4.1） |
+| **协议完整** | 5355 legacy DNS-SD + mDNS 双服务宣告 + TCP 8899 控制口 + RTSP/RTP/TS/AES/AAC 全链路 |
+| **Web 配网** | 仿 <https://mimo.xiaomi.com/> 视觉风格的单文件内嵌页面，零外部依赖 |
+| **低 BOM** | 两块模块 + 几根杜邦线，约 20 元 |
+| **双任务音频** | 解码与 I2S 输出解耦，128KB PSRAM 环形缓冲吸收网络抖动 |
 
 ---
 
@@ -30,48 +55,110 @@ ESP32-S3 SuperMini ──I2S──▶ GY-PCM5102 ──▶ 3.5mm 耳机
 
 ### 接线
 
-| 信号 | GPIO | 说明 |
-|---|---|---|
-| BCLK | **8** | 位时钟 → PCM5102 的 BCK |
-| LRCK | **7** | 左右声道时钟 → LRCK |
-| DIN | **6** | 音频数据 → DIN |
-| MCLK | **9** | → 模块的 SCK 焊盘。**默认已启用**，见下方说明 |
-| GND | GND | **必须共地** |
-| 3V3 | 3V3 | 模块供电 |
+| 信号 | GPIO | 定义位置 | 说明 |
+|---|---|---|---|
+| BCLK | **12** | `main/Kconfig.projbuild` `MIPLAY_I2S_BCLK_GPIO` | 位时钟 → PCM5102 的 BCK |
+| LRCK | **10** | `main/Kconfig.projbuild` `MIPLAY_I2S_LRCK_GPIO` | 左右声道时钟 → LRCK |
+| DIN | **11** | `main/Kconfig.projbuild` `MIPLAY_I2S_DIN_GPIO` | 音频数据 → DIN |
+| MCLK | **13** | `main/Kconfig.projbuild` `MIPLAY_I2S_MCLK_GPIO` | → 模块的 SCK 焊盘。**默认已启用**，见下方说明 |
+| GND | GND | — | **必须共地** |
+| 3V3 | 3V3 | — | 模块供电 |
+
+> 引脚在 `menuconfig → MiPlay Mini Amp → I2S / PCM5102A` 可改，无需动代码。
+> 下表 GPIO 号即 `sdkconfig` 里的固化值。
 
 **MCLK 说明（重要）**
 
 GY-PCM5102 在市面有两种流通版本，外观无法区分：
 
 - **SCK 焊盘悬空** → **必须**由主控喂 MCLK，否则完全无声。**本工程按这一版接线**，
-  `MIPLAY_I2S_ENABLE_MCLK` 默认已打开，GPIO9 接模块 SCK。
+  `MIPLAY_I2S_ENABLE_MCLK` 默认已打开，GPIO13 接模块 SCK。
 - **SCK 焊盘已接地** → PCM5102A 用内部 PLL 从 BCK 锁相，**不需要 MCLK**。
-  此时若仍把 GPIO9 接上去，等于输出脚对地短路，必须关闭
+  此时若仍把 GPIO13 接上去，等于输出脚对地短路，必须关闭
   `MIPLAY_I2S_ENABLE_MCLK` 并断开这条线。
 
 **怎么判断手上是哪一版**：万用表量 SCK 焊盘对 GND —— 开路是悬空版（保持默认），
 接近 0Ω 是接地版（关掉 MCLK 开关、不接这根线）。
 
 **避开**：GPIO19/20（USB-JTAG，日志就靠它）、GPIO0/3/45/46（strapping）、
-GPIO26-32（片内 Flash/PSRAM 占用）。当前用的 6-9 全部落在 P2 区（无限制）。
+GPIO26-32（片内 Flash/PSRAM 占用）。当前用的 10-13 全部落在 P2 区（无限制）。
 
 ---
 
-## 2. 构建
+## 2. 快速上手
+
+### 元件清单
+
+| 元件 | 说明 | 参考价 |
+|---|---|---|
+| ESP32-S3 SuperMini | 需 **FH4R2** 型号（4MB Flash + 2MB PSRAM） | ~15 元 |
+| GY-PCM5102 | 紫色 DAC 小板，带 3.5mm 座 | ~5 元 |
+| 杜邦线 | 6 根（BCLK/LRCK/DIN/MCLK/GND/3V3） | — |
+| USB-C 线 | 供电 + 烧录 | — |
+
+### 方式一：下载固件直接烧录
+
+从 [Releases](https://github.com/MYHealer/miplay-mini-amp/releases) 下载最新版 `miplay-mini-amp.bin`。
+
+```bash
+pip install esptool
+
+# 全量烧录（首次，COM 号按实际改）
+esptool --chip esp32s3 -p COM18 -b 460800 \
+  --before usb_reset --after hard_reset \
+  write_flash --flash_mode dio --flash_size 4MB --flash_freq 80m \
+  0x0     bootloader.bin \
+  0x8000  partition-table.bin \
+  0x10000 miplay-mini-amp.bin
+```
+
+**仅升级固件**（保留已配置的 Wi-Fi 凭据）：
+
+```bash
+esptool --chip esp32s3 -p COM18 -b 460800 \
+  --before usb_reset --after hard_reset \
+  write_flash --flash_mode dio --flash_size 4MB --flash_freq 80m \
+  0x10000 miplay-mini-amp.bin
+```
+
+> ⚠️ 改代码后只烧 `0x10000` 一个地址即可，**不要全量烧**——那会覆盖 `nvs` 分区，
+> 已配好的 Wi-Fi 密码丢失，需要重新配网。
+>
+> ⚠️ **`--flash_size 4MB`**：本板是 FH4R2（4MB Flash + 2MB PSRAM）。
+> 别照抄其他 ESP32-S3 项目的 8MB/16MB。
+>
+> ⚠️ **`--before usb_reset`**：S3 内置 USB-Serial-JTAG 在普通复位下可能进不了下载模式，
+> 用 `usb_reset` 最稳。副作用是 USB 会重枚举，**COM 口号可能变化**，烧完重新插一次即可。
+
+### 方式二：从源码构建
+
+```bash
+# 1) 编译
+cd E:\ESP && . .\esp_env.ps1
+cd E:\ESP\miplay-mini-amp
+& $PYTHON $IDF_PY set-target esp32s3
+& $PYTHON $IDF_PY build
+
+# 2) 烧录 + 监视
+& $PYTHON $IDF_PY -p COMx flash monitor
+```
+
+### 上电后三步
+
+**① 配网** → **② 手机找设备** → **③ 投屏播放**
+
+1. 设备首次上电无凭据，开一个**开放热点** `MiPlay-Amp-XXXX`
+2. 手机连上该热点，浏览器**自动弹出**配网页（强制门户），选 Wi-Fi 填密码
+3. 连上后设备关热点、进正常待机（蓝灯）。手机打开「妙播」→ 找到设备 → 投屏
+
+---
+
+## 3. 构建详解
 
 必须用 **PowerShell**（Git Bash 会踩 MSYSTEM 污染，`idf.py` 秒退）。
 
 ⚠ `idf.py` **不在 PATH 上**：`esp_env.ps1` 只导出 `$PYTHON` 与 `$IDF_PY` 两个变量，
-必须显式 `& $PYTHON $IDF_PY <args>` 调用。
-
-```powershell
-cd E:\ESP
-. .\esp_env.ps1
-cd E:\ESP\miplay-mini-amp
-& $PYTHON $IDF_PY set-target esp32s3
-& $PYTHON $IDF_PY build
-& $PYTHON $IDF_PY -p COMx flash monitor
-```
+必须显式 `& $PYTHON $IDF_PY <args>` 调用（命令见 §2 方式二）。
 
 构建目录**必须是纯 ASCII 路径** —— ccache 4.x 遇到中文路径必崩，
 所以本项目放在 `E:\ESP\miplay-mini-amp` 而不是中文目录。
@@ -79,13 +166,23 @@ cd E:\ESP\miplay-mini-amp
 **看构建日志**：PowerShell 的 `>` 重定向产出 UTF-16LE（字符间夹空格，无法读），
 要落盘用 `| Out-File -Encoding utf8`。
 
+**抓完整启动日志**：`idf.py monitor` 是**连上之后才开始收**的，而 ROM bootloader
+与 `app_main` 早于它——会丢掉启动头。要抓全，用 `tools/capture_boot_log.py`：
+它先持有串口、再用 RTS/DTR 触发复位，保证不丢任何一行。
+
+```powershell
+& $PYTHON tools/capture_boot_log.py COM18 14   # 端口 + 抓取秒数
+```
+
+> 脚本内含 20 次重试：`usb_reset` 会让 USB 短暂消失，端口要等它稳定。
+
 ---
 
-## 3. 配置
+## 4. 配置
 
 `idf.py menuconfig` → `MiPlay Mini Amp`：
 
-### 3.1 Wi-Fi 配网（无编译期凭据）
+### 4.1 Wi-Fi 配网（无编译期凭据）
 
 **凭据不在固件里。** 同一份固件刷到任意一台设备都能用，家庭 Wi-Fi 密码
 不进源码、不进 sdkconfig。
@@ -122,7 +219,7 @@ cd E:\ESP\miplay-mini-amp
 
 手机与设备必须**同一网段**，否则 mDNS/UDP 发现不到。
 
-### 3.2 配网页与强制门户
+### 4.2 配网页与强制门户
 
 手机连上 AP 后应当**自动弹出**"此网络需要登录"窗口。这个"自动"需要两个
 服务同时到位，缺一不可：
@@ -149,20 +246,21 @@ cd E:\ESP\miplay-mini-amp
 页面本身（`main/prov_page.h`）只调用 `/api/scan`、`/api/connect`、`/api/info`
 三个相对路径接口，风格仿 <https://mimo.xiaomi.com/>。
 
-### 3.3 其他
+### 4.3 其他
 
 | 配置项 | 默认 | 说明 |
 |---|---|---|
-| `MIPLAY_I2S_BCLK_GPIO` | 8 | |
-| `MIPLAY_I2S_LRCK_GPIO` | 7 | |
-| `MIPLAY_I2S_DIN_GPIO` | 6 | |
+| `MIPLAY_WIFI_MAX_RETRY` | 3 | 连 STA 失败几次后回落开 AP。范围 1–20 |
+| `MIPLAY_I2S_BCLK_GPIO` | 12 | |
+| `MIPLAY_I2S_LRCK_GPIO` | 10 | |
+| `MIPLAY_I2S_DIN_GPIO` | 11 | |
 | `MIPLAY_I2S_ENABLE_MCLK` | **y** | 本工程按 SCK 悬空版接线。若模块 SCK 已接地必须关掉 |
-| `MIPLAY_I2S_MCLK_GPIO` | 9 | 接模块 SCK 焊盘 |
+| `MIPLAY_I2S_MCLK_GPIO` | 13 | 接模块 SCK 焊盘 |
 | `MIPLAY_DEFAULT_VOLUME` | 70 | PCM5102A 无 I2C 口，音量是软件缩放 |
 | `MIPLAY_LED_ENABLE` | y | 板子没灯就关掉 |
 | `MIPLAY_LED_GPIO` | 48 | SuperMini 板载 WS2812 |
 
-### 3.4 分区表（`partitions.csv`）
+### 4.4 分区表（`partitions.csv`）
 
 无 OTA，单 factory 分区：
 
@@ -182,7 +280,7 @@ app 给到 2.94 MB 而非更小：`esp_aac_dec` + mbedtls + Wi-Fi/lwIP 的静态
 **溢出量与二进制大小恰好差 1 MB**，这个数字关系就是"分区表用错"的判据。
 已写入 `sdkconfig.defaults`。
 
-### 3.5 内存要点
+### 4.5 内存要点
 
 **必须 `CONFIG_SPIRAM_MODE_QUAD=y`。** FH4R2 的片内 PSRAM 是 Quad SPI，
 照抄参考工程的 `OCT` 会启动即 panic（`Virtual address not enough for PSRAM!`）。
@@ -195,11 +293,11 @@ app 给到 2.94 MB 而非更小：`esp_aac_dec` + mbedtls + Wi-Fi/lwIP 的静态
 
 打开前已逐项核实安全性：该缓冲是纯软件中转（`memcpy` → `mbedtls_aes_crypt_cbc`
 → `memcpy`），**无 DMA、无 ISR 访问**；且同函数里的中间缓冲 `padded` 本来就已
-用 `heap_caps_calloc(..., MALLOC_CAP_SPIRAM)` 分配在 PSRAM。见 §7。
+用 `heap_caps_calloc(..., MALLOC_CAP_SPIRAM)` 分配在 PSRAM。见 §8。
 
 ---
 
-## 4. 状态 LED
+## 5. 状态 LED
 
 板载 WS2812（GPIO48）。下表取自 `status_led.cpp` 的 `state_color()` /
 `brightness_phase()`，是**实际行为**而非设计意图：
@@ -240,7 +338,7 @@ AP 态压到 60% 亮度是刻意的：配网要等很久，全亮的橙在暗处
 
 ---
 
-## 5. 验证顺序
+## 6. 验证顺序
 
 分五步，每步都有明确判据。**卡在哪一步就只查那一步**。
 
@@ -259,7 +357,7 @@ AP 态压到 60% 亮度是刻意的：配网要等很久，全亮的橙在暗处
 
 - **第 2 步失败（有 AP 但不弹门户）** → 八成是 DNS 劫持没起来。
   查串口有没有 `DNS hijack up: all A queries -> AP IP`；没有就是
-  `dns_server` 组件没链进来。门户的这两半是**与**关系，缺一不弹，见 §3.2。
+  `dns_server` 组件没链进来。门户的这两半是**与**关系，缺一不弹，见 §4.2。
   另外浏览器缓存可能留着旧页面，先强刷一次。
 - **第 2 步失败（连不上 STA）** → 页面提示"连接失败：密码不对，或这个网络不在范围内"。
   查 `scan served: N ap(s)` 看设备到底扫到了什么（扫到 0 条多半是 5GHz 或距离太远）。
@@ -273,7 +371,7 @@ AP 态压到 60% 亮度是刻意的：配网要等很久，全亮的橙在暗处
 
 ---
 
-## 6. 目录结构
+## 7. 目录结构
 
 ```
 miplay-mini-amp/
@@ -283,7 +381,12 @@ miplay-mini-amp/
 ├── DESIGN.md                # 完整设计文档（决策依据）
 ├── README.md                # 本文
 ├── components/
-│   ├── miplay_remote/       # 协议层，从 RLCD_CLOCK 移植（见 §7）
+│   ├── miplay_remote/       # 协议层（见 §8）
+│   │                        #   设备标识符 / 发现通道的详解见 §9
+│   │                        #   miplay_identity.cpp   身份派生（idHash/appsData/lyra AppData）
+│   │                        #   miplay_discovery.cpp  5355 广播 + 5353 mDNS 宣告
+│   │                        #   miplay_control.cpp    TCP 8899 控制口
+│   │                        #   miplay_media.cpp      RTSP/RTP/TS/AES/AAC 投屏链路
 │   └── dns_server/          # 强制门户的 DNS 劫持半边
 │                            #   取自 IDF 官方 captive_portal 示例，字节一致
 └── main/
@@ -306,7 +409,7 @@ miplay-mini-amp/
 
 ---
 
-## 7. 与上游的差异
+## 8. 与上游的差异
 
 协议层 `components/miplay_remote/` 照搬自：
 
@@ -320,17 +423,18 @@ E:\ESP\ESP32-S3-RLCD-4.2-main\ESP32-S3-RLCD-4.2-main\RLCD_CLOCK\components\mipla
 上游硬件是 **N16R8**（16MB Flash + 8MB Octal PSRAM），本机是 **FH4R2**
 （4MB Flash + 2MB Quad PSRAM），所以内存与 Flash 配置全部重做。
 
-下表的改动清单已用 `diff -rq` 对上游目录逐个核对过：**共 4 个文件有差异**，
-其余 13 个与上游字节一致。任何后续修改都应先跑一次这个 diff 确认范围。
+下表的改动清单已用 `diff -rq` 对上游目录逐个核对过：**共 5 个文件有差异**，
+其余 12 个与上游字节一致。任何后续修改都应先跑一次这个 diff 确认范围。
 
-### 已改（共 4 处，均附理由写入源码注释）
+### 已改（共 5 处，均附理由写入源码注释）
 
 | 文件 | 改动 | 理由 |
 |---|---|---|
 | `miplay_session.h` | 会话栈 **256KB → 64KB** | 实测该任务栈上最大对象是 `body[512]`，调用链深度估算 <8KB，64KB 留 8 倍余量 |
 | `miplay_media.cpp:1672` | rtsp 任务退出改用 `miplay_delete_current_task()` | **修 bug**：原为 `vTaskDeleteWithCaps()`，绕过追踪表清槽 → 槽位泄漏 → 后续任务 PSRAM 栈永不释放 |
-| `miplay_remote_internal.h` | `MIPLAY_DEVICE_DISPLAY_NAME` → `"小米妙播耳放"` | 设备在手机妙播列表里的显示名。硬约束只有两条：不含 `.`（会破坏 DNS label 压缩指针）、编码后 ≤63 字节（`dns_push_label` 用 `strlen` 截断） |
+| `miplay_remote_internal.h` | `MIPLAY_DEVICE_DISPLAY_NAME` → `"MiPlay Mini Amp"` | 设备在手机妙播列表里的显示名。硬约束只有两条：不含 `.`（会破坏 DNS label 压缩指针）、编码后 ≤63 字节（`dns_push_label` 用 `strlen` 截断）。见 §9.5 的 27 字节上限 |
 | `miplay_proto.h` | 仅补注释（值未改） | 记录「256KB 为何不能下调」的核查结论 |
+| `miplay_control.cpp:187` | **删除一条过期注释** | 原注释写「与 _mi-connect 的 dev=2 对齐」，但 `MIPLAY_DEV` 早已改为 `"4"`（音箱）。注释记录的是**当初快照值**，宏会变而注释不会——留着就是唯一会说谎的地方。删掉即可：两处用的是同一个宏，代码本身已说明对齐关系 |
 
 ### 已核查但**刻意不改**（原计划要改，证据不支持）
 
@@ -393,7 +497,153 @@ region 'dram0_0_seg' overflowed by 48280 bytes
 
 ---
 
-## 8. 已知风险 / 待实测确认
+## 9. 小米妙播协议：设备标识符
+
+**这一节是排查"手机扫不到设备"的第一手资料。** 手机（妙播 / HyperOS 投屏）
+识别一台接收端，靠的是下面三组**逐字节固定**的字段。任何一组改错，症状都不是
+报错，而是**设备从列表里静默消失**——所以改动前务必对照本表。
+
+三个发现通道按时间顺序：
+
+```
+① UDP 5355 广播/应答（legacy DNS-SD，手机开机即扫）
+       │  命中 → 拿到 IP + 端口 8899
+       ▼
+② mDNS 5353 主动宣告（_mi-connect._udp + _lyra-mdns._udp 两条服务）
+       │  手机比对两条路径的身份字段，不一致则整条记录作废
+       ▼
+③ TCP 8899 控制口（手机建立会话，下发 SetMirrorKey 启动投屏）
+```
+
+### 9.1 身份字段的派生（`miplay_identity.cpp`）
+
+| 字段 | 值 | 派生方式 |
+|---|---|---|
+| `device_id` | 如 `92445368` | **MAC 后 4 字节的大写 hex**（8 字符）。既是 DNS 主机名前缀，也是后续所有哈希的种子 |
+| `idHash` | 如 `MVo4` | **4 字符标准 base64**。三步：① `SHA256(device_id)` 前 3 字节 → base64url → `short_id`（3 字符）；② 把 `short_id` 这 3 个 **ASCII 字节**再走一遍标准 base64 |
+| `inst_name` | `MiPlay Mini Amp(1Z8I7NJ9DJ)` | **`"<显示名>(<SHA256 前 10 个 base64url 字符>)"`**，后缀防同网内多台设备重名 |
+| `s_appsdata` | `gQAEBIMiww==` | **硬编码，必须原样照抄**。解码后是 `81 00 04 04 83 22 C3`：`0x0483` 是 Lyra 能力位，`0x22C3` = 十进制 8899 是控制端口 |
+| `s_mac_b64` | MAC 的 base64 | `mac[0..2]` 与 `mac[3..5]` 各编一段，拼成 8 字符 |
+
+**⚠ `idHash` 最容易写错的地方**：把 `short_id`（3 字符）直接当 `idHash` 发出。
+权威定义来自 `FusionPlay-Android discovery.rs:2055-2058`——
+`idHash = base64(short_id)`，因为 `short_id` 恰好 3 字节，标准 base64 结果**恒为 4 字符**。
+发出 3 字符会让手机的 `BonjourGovernor` 判定身份不一致。
+
+**⚠ `idHash` 必须在两条路径上逐字节相同**：5355 的 `idhash` 与 mDNS 的 `idHash`
+是同一个字符串的两个副本。手机侧会比对，任何不一致都会让**整条记录被拒**。
+（旧实现曾在 5355 侧截断成 3 字符，症状正是"设备扫不到"。）
+
+### 9.2 通道 ①：UDP 5355 的 TXT（`build_lan_packet`）
+
+单条 TXT 记录，内容是一段 JSON：
+
+```json
+{"supportLyra":true,
+ "mac":"AA:BB:CC:DD:EE:FF",
+ "ID":<stable_id>,
+ "type":3,
+ "idhash":"<4 字符>",
+ "extraAbility":0}
+```
+
+| 键 | 说明 |
+|---|---|
+| `type` | **`3` = 申报 TV**。这是关键字段，决定手机把它归入哪一类接收端 |
+| `ID` | MAC 后 4 字节拼成的 int，**清掉最高位**（`& 0x7FFFFFFF`）避免负数 |
+| `supportLyra` | `true`，表示支持 Lyra 遥控路径 |
+| `idhash` | 必须与 8.3 的 `idHash` 逐字节相同 |
+
+SRV 记录的端口固定 **8899**，主机名是 `miplay-<MAC后3字节>`。
+
+### 9.3 通道 ②：mDNS 5353 的两条服务
+
+**`_mi-connect._udp`** — 主发现服务，9 条 TXT：
+
+| 键 | 值 | 说明 |
+|---|---|---|
+| `version` | `196608` | = `0x30000` |
+| `apps` | `[5]` | |
+| `flags` | `CgE=` | |
+| `name` | `MiPlay Mini Amp` | **用户在手机列表里唯一能看到的标识** |
+| `idHash` | `MVo4` | 见 8.1 |
+| `dev` | **`4`** | **设备类型：`4` = 音箱**（`MIPLAY_DEV`）。取值表见下 |
+| `sec` | `4` | 与 `dev` 取同值（`MIPLAY_SEC`） |
+| `appsData` | `gQAEBIMiww==` | 硬编码，见 8.1 |
+| `mac` | MAC 的 base64 | |
+
+**`_lyra-mdns._udp`** — Lyra 遥控路径，5 条 TXT：
+
+| 键 | 值 | 说明 |
+|---|---|---|
+| `AppData` | base64 二进制 | 见下方字节布局 |
+| `MediumType` | `8192` | |
+| `CH` | `0` | |
+| `DebugInfo` | `{msg:..., ifname:STA, v4:...}` | IP 中间两段做 `数字→'#'+数字` 编码 |
+| `TS` | Unix epoch **毫秒** | 手机据此判断宣告新鲜度 |
+
+**`dev` 设备类型取值表**（`MIPLAY_DEV` / `MIPLAY_SEC`）——
+以下全部经 **2026-09-28 实机逐个烧录确认**：
+
+| 值 | 手机妙播列表显示 | 备注 |
+|---|---|---|
+| `1` | 手机 | 参考实现无此值，实测补出 |
+| `2` | 电视 / Android TV | 与参考实现一致 |
+| `3` | 电脑 | |
+| **`4`** | **音箱** ← 本工程 | 与 FusionPlay `Speaker=4` 吻合 |
+| `5` | 车 | 与 FusionPlay `Vehicle=5` 吻合 |
+| `6` / `7` / `8` | 蓝牙喇叭 | 参考实现无此值；**三者显示完全相同** |
+
+> `6`/`7`/`8` 都回落成「蓝牙喇叭」+ 普通图标——手机端对**未映射值统一回落**。
+> 有区分度的只有 `1`–`5` 这五个连续锚点，继续试 `9`/`10`… 收益为零。
+
+**⚠ 取 `dev=4`（音箱）的代价**：实机测得此时设备**网络层可发现**（`_miplay_lan`
+有应答、mDNS 注册成功），但**可能不进妙播投屏列表**；`dev=2`（电视）实测可投屏。
+本工程取 `4` 是**有意选择**（显示为音箱图标），若实测投屏列表里找不到设备，
+改回 `"2"` 即可。
+
+**`AppData` 的字节布局**（`appdata[]`，base64 前）：
+
+```
+偏移  值        含义
+ 0    0x00      固定
+ 1    0x40      固定
+ 2    0x03      设备类型：3 = TV
+ 3-6  MAC[2..5] 设备 MAC 后 4 字节
+ 7-22 kFixed[16] 固定序列 00 05 19 24 | 10 01 03 0a 03 01 da ae 01 01 80 02
+ 23   name_len  显示名长度（单字节前缀）
+ 24.. 显示名     ASCII
+ 末3  0x25 0x01 0x03  固定尾
+```
+
+### 9.4 通道 ③：TCP 8899 控制口
+
+手机识别到设备后会连 8899 建立会话。`miplay_control.cpp:187` 的
+`{"deviceType", MIPLAY_DEV}` 必须与通道 ②/① 的类型申报**对齐**。
+
+真正启动音频投屏的是控制口的 **`SetMirrorKey(0x006C)`** 事件——
+它由手机下发，`miplay_media.cpp` 收到后才开始 RTSP/RTP/TS/AES/AAC 全链路。
+这也是为什么 `components/miplay_remote/include/miplay_remote.h` 顶部那句
+「剥离了 RTSP 投屏、音频管线」是**过时的**（见 §10 末）。
+
+### 9.5 显示名的两条硬约束
+
+`MIPLAY_DEVICE_DISPLAY_NAME` 看似自由文本，实际受 DNS 层限制：
+
+```
+inst_name = "<显示名>(<10 字符哈希后缀>)"   → 存入 s_inst_name[40]
+```
+
+- **不能含 `.`**：点号是 DNS label 分隔符，手机解析 PTR 时会当成两个 label，
+  后面 SRV/TXT 的压缩指针偏移随之错乱，整包被判畸形而丢弃——
+  表现就是"设备明明应答了 5355，手机列表里却没有它"。
+- **显示名最多 27 字节**：后缀固定 12 字节（`(` + 10 字符 + `)`），
+  `s_inst_name` 是 40 字节，`snprintf` 会截断。`"MiPlay Mini Amp"` 是 15 字节 →
+  实例名 27 字节，安全。且 27 < 63（单 label 上限），`dns_push_label` 不会截断。
+
+---
+
+## 10. 已知风险 / 待实测确认
 
 | 项 | 状态 | 说明 |
 |---|---|---|
@@ -435,10 +685,74 @@ region 'dram0_0_seg' overflowed by 48280 bytes
 
 ---
 
-## 9. 环境
+## 11. 环境
 
 | 项 | 值 |
 |---|---|
 | ESP-IDF | v5.5.4（`E:\ESP\.espressif\v5.5.4\esp-idf`） |
 | 环境脚本 | `E:\ESP\esp_env.ps1`（**必须 PowerShell**） |
 | 构建目录 | 必须纯 ASCII 路径（ccache 4.x + 中文路径必崩） |
+
+---
+
+## 参考项目及致谢
+
+本项目建立在多个上游开源工作之上，特此致谢。
+
+### 参考项目
+
+| 项目 | 说明 |
+|---|---|
+| [MYHealer/esp-miply-1.85touch](https://github.com/MYHealer/esp-miply-1.85touch) | 同作者的 1.85" 触屏版本。本项目协议层组件即从其剥离，I2S 输出层的 DMA 配置（12 × 512）亦参考其板级定义 |
+| [MYHealer/dlna-esp32](https://github.com/MYHealer/dlna-esp32) | 同作者的纯 DLNA 投屏实现，是协议层与音频管线的起点 |
+| [MYHealer/airkan-sdk](https://github.com/MYHealer/airkan-sdk) | 小米妙享遥控器按键通道的独立实现（本工程未使用，供扩展参考） |
+| [rosienosiesie/FusionPlay-Android](https://github.com/rosienosiesie/FusionPlay-Android) | Android 端 MiPlay 播放器，**本项目 MiPlay 协议实现的关键参考**：`idHash` 三步派生、`appsData` 硬编码值、lyra `AppData` 字节布局均据此对齐 |
+
+### 第三方组件致谢
+
+| 组件 | 作者 / 组织 | 用途 |
+|---|---|---|
+| [ESP-IDF](https://github.com/espressif/esp-idf) | Espressif Systems | 芯片 SDK 与构建系统 |
+| [esp_audio_codec](https://components.espressif.com/components/espressif/esp_audio_codec) | Espressif Systems | AAC-LC 解码 |
+| [led_strip](https://components.espressif.com/components/espressif/led_strip) | Espressif Systems | 板载 WS2812 状态灯（RMT 后端） |
+| [mdns](https://components.espressif.com/components/espressif/mdns) | Espressif Systems | mDNS 服务注册与宣告 |
+| [mbedtls](https://github.com/Mbed-TLS/mbedtls) | TrustedFirmware | SHA-256 与 AES-128-CBC |
+| IDF `captive_portal` 示例 | Espressif Systems | 强制门户的 DNS 劫持组件（`components/dns_server/`） |
+
+### 协议实现致谢
+
+- **小米妙播（MiPlay）** 的协议细节来自对官方客户端与固件的逆向分析，
+  以及社区项目 [FusionPlay](https://github.com/rosienosiesie/FusionPlay-Android)
+  公开的 Rust 实现。感谢这些工作为设备标识符与发现流程提供了关键证据链。
+- 感谢**小米互通互联的协议**与**乐鑫 ESP32 芯片**的性能，
+  以及**立创开源硬件平台**的包容开放。
+
+---
+
+## 免责声明
+
+本项目为独立的逆向工程实践，**仅供学习与个人研究使用**，与小米公司无任何隶属、认可或赞助关系。
+
+- ⚠️ **仅供学习使用** — 本项目用于协议分析、嵌入式开发与音视频技术的学习交流，请勿用于任何商业用途。
+- 🚫 **禁止售卖** — 不得将本项目（含源码、固件、衍生作品）用于销售、批量生产或任何形式的商业牟利。
+- 📄 **责任自负** — 使用本项目即表示你自行承担全部责任，包括对小米服务条款的合规性。作者不提供任何担保，亦不承担任何责任。
+- ™️ **商标归属** — 「小米」「妙播」「妙享」「米家」及相关标识均为小米公司商标，本项目对其的使用仅为技术说明性引用。
+
+---
+
+## 许可证
+
+本项目采用 **[AGPL-3.0](LICENSE)**（GNU Affero General Public License v3.0）许可。
+
+> ⚠️ AGPL-3.0 是**强 Copyleft** 许可：任何修改、分发，**以及通过网络提供服务**的行为，都必须
+> 以同样的 AGPL-3.0 完整开源（第 13 条「Remote Network Interaction」）。闭源商用与售卖均不被允许。
+
+### 第三方组件许可证
+
+本项目使用的第三方组件均为宽松许可，与 AGPL-3.0 **兼容**（可被 AGPL 项目引用，各自仍保留原许可）：
+
+| 组件 | 许可证 |
+|---|---|
+| ESP-IDF / esp_audio_codec / led_strip / mdns | Apache-2.0 |
+| mbedtls | Apache-2.0 |
+| IDF `captive_portal` 示例（含 `dns_server`） | Apache-2.0 |

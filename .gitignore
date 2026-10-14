@@ -1,7 +1,19 @@
+# 构建产物
 build/
 managed_components/
 sdkconfig.old
-*.txt
+
+# 二进制
 *.bin
 *.elf
 *.map
+
+# 串口日志与调试残留（开发过程产物，不入库）
+*.txt
+mon_*.log
+_sniff.py
+_backup_session_changes_*.patch
+
+# Python
+__pycache__/
+*.pyc

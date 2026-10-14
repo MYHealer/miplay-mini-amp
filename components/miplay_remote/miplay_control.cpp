@@ -184,7 +184,7 @@ int build_device_info_payload(uint8_t *out, size_t out_max)
         {"canRevCtrl", "1"},
         {"channel", ""},
         {"deviceId", s_device_id},  // MAC 后 4 字节的 8 hex
-        {"deviceType", MIPLAY_DEV}, // 与 _mi-connect 的 dev=2 对齐
+        {"deviceType", MIPLAY_DEV},
         {"model", "Android TV"},
         {"needAblum", "1"},
         {"needLrc", "1"},
